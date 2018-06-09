@@ -29,10 +29,12 @@ import org.jetbrains.kotlin.script.KotlinScriptDefinition
 import org.jetbrains.kotlin.script.ScriptDefinitionProvider
 import org.jetbrains.kotlin.types.TypeUtils
 import org.jetbrains.kotlin.types.expressions.ExpressionTypingServices
+import org.jetbrains.kotlin.util.KotlinFrontEndException
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
+import org.javacs.kt.util.KotlinLSException
 
 /**
  * Incrementally compiles files and expressions.
@@ -43,10 +45,17 @@ class Compiler(classPath: Set<Path>) {
         put(CommonConfigurationKeys.MODULE_NAME, JvmAbi.DEFAULT_MODULE_NAME)
         addAll(JVMConfigurationKeys.CONTENT_ROOTS, classPath.map { JvmClasspathRoot(it.toFile())})
     }
-    private val env = KotlinCoreEnvironment.createForProduction(
+    private val env: KotlinCoreEnvironment
+
+    init {
+        System.setProperty("idea.io.use.fallback", "true")
+        env = KotlinCoreEnvironment.createForProduction(
             parentDisposable = Disposable { },
             configuration = config,
-            configFiles = EnvironmentConfigFiles.JVM_CONFIG_FILES)
+            configFiles = EnvironmentConfigFiles.JVM_CONFIG_FILES
+        )
+    }
+
     private val parser = KtPsiFactory(env.project)
     private val localFileSystem = VirtualFileManager.getInstance().getFileSystem(StandardFileSystems.FILE_PROTOCOL)
     private val scripts = ScriptDefinitionProvider.getInstance(env.project) as CliScriptDefinitionProvider
@@ -124,15 +133,19 @@ class Compiler(classPath: Set<Path>) {
 
     fun compileExpression(expression: KtExpression, scopeWithImports: LexicalScope, sourcePath: Collection<KtFile>): Pair<BindingContext, ComponentProvider> {
         LOG.info("Compiling ${expression.text}")
-        val (container, trace) = createContainer(sourcePath)
-        val incrementalCompiler = container.get<ExpressionTypingServices>()
-        incrementalCompiler.getTypeInfo(
-                scopeWithImports,
-                expression,
-                TypeUtils.NO_EXPECTED_TYPE,
-                DataFlowInfo.EMPTY,
-                trace,
-                true)
-        return Pair(trace.bindingContext, container)
+        try {
+            val (container, trace) = createContainer(sourcePath)
+            val incrementalCompiler = container.get<ExpressionTypingServices>()
+            incrementalCompiler.getTypeInfo(
+                    scopeWithImports,
+                    expression,
+                    TypeUtils.NO_EXPECTED_TYPE,
+                    DataFlowInfo.EMPTY,
+                    trace,
+                    true)
+            return Pair(trace.bindingContext, container)
+        } catch (e: KotlinFrontEndException) {
+            throw KotlinLSException("Error while analyzing: ${expression.text}", e)
+        }
     }
 }

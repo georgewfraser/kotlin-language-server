@@ -2,8 +2,10 @@ package org.javacs.kt.classpath
 
 import java.util.logging.Level
 import org.javacs.kt.LOG
+import org.javacs.kt.util.winCompatiblePathOf
 import org.jetbrains.kotlin.utils.ifEmpty
 import java.io.File
+import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
@@ -12,24 +14,42 @@ import java.util.stream.Collectors
 import java.util.function.BiPredicate
 import java.util.Comparator
 
-fun findClassPath(workspaceRoots: Collection<Path>): Set<Path> =
-        workspaceRoots
-                .flatMap { pomFiles(it) }
-                .flatMap { readPom(it) }
-                .toSet()
-                .ifEmpty { backupClassPath() }
+fun findClassPath(workspaceRoots: Collection<Path>): Set<Path> {
+    return workspaceRoots
+            .flatMap { projectFiles(it) }
+            .flatMap { readProjectFile(it) }
+            .toSet()
+            .ifEmpty { backupClassPath() }
+}
 
 private fun backupClassPath() =
     listOfNotNull(findKotlinStdlib()).toSet()
 
-private fun pomFiles(workspaceRoot: Path): Set<Path> =
-        Files.walk(workspaceRoot)
-                .filter { it.endsWith("pom.xml") }
-                .collect(Collectors.toSet())
+private fun projectFiles(workspaceRoot: Path): Set<Path> {
+    return Files.walk(workspaceRoot)
+            .filter { isMavenBuildFile(it) || isGradleBuildFile(it) }
+            .collect(Collectors.toSet())
+}
+
+private fun readProjectFile(file: Path): Set<Path> {
+    if (isMavenBuildFile(file)) {
+        // Project uses a Maven model
+        return readPom(file)
+    } else if (isGradleBuildFile(file)) {
+        // Project uses a Gradle model
+        return readBuildGradle(file)
+    } else {
+        throw IllegalArgumentException("$file is not a valid project configuration file (pom.xml or build.gradle)")
+    }
+}
+
+private fun isMavenBuildFile(file: Path) = file.endsWith("pom.xml")
+
+private fun isGradleBuildFile(file: Path) = file.endsWith("build.gradle") || file.endsWith("build.gradle.kts")
 
 private fun readPom(pom: Path): Set<Path> {
-    val mavenOutput = genDependencyList(pom)
-    val artifacts = readDependencyList(mavenOutput)
+    val mavenOutput = generateMavenDependencyList(pom)
+    val artifacts = readMavenDependencyList(mavenOutput)
 
     when {
         artifacts.isEmpty() -> LOG.warning("No artifacts found in $pom")
@@ -40,7 +60,7 @@ private fun readPom(pom: Path): Set<Path> {
     return artifacts.mapNotNull({ findArtifact(it, false) }).toSet()
 }
 
-private fun genDependencyList(pom: Path): Path {
+private fun generateMavenDependencyList(pom: Path): Path {
     val mavenOutput = Files.createTempFile("deps", ".txt")
     val workingDirectory = pom.toAbsolutePath().parent.toFile()
     val cmd = "${mvnCommand()} dependency:list -DincludeScope=test -DoutputFile=$mavenOutput"
@@ -54,14 +74,14 @@ private fun genDependencyList(pom: Path): Path {
 
 private val artifact = Regex(".*:.*:.*:.*:.*")
 
-private fun readDependencyList(mavenOutput: Path): Set<Artifact> =
+private fun readMavenDependencyList(mavenOutput: Path): Set<Artifact> =
         mavenOutput.toFile()
                 .readLines()
                 .filter { it.matches(artifact) }
-                .map(::parseArtifact)
+                .map(::parseMavenArtifact)
                 .toSet()
 
-private fun parseArtifact(string: String): Artifact {
+private fun parseMavenArtifact(string: String): Artifact {
     val parts = string.trim().split(':')
 
     return when (parts.size) {
@@ -84,7 +104,7 @@ fun findKotlinStdlib(): Path? {
     val artifactDir = mavenHome.resolve("repository")
             .resolve(group.replace('.', File.separatorChar))
             .resolve(artifact)
-    val isKotlinStdlib = BiPredicate<Path, BasicFileAttributes> { file, attr -> 
+    val isKotlinStdlib = BiPredicate<Path, BasicFileAttributes> { file, attr ->
         val name = file.fileName.toString()
         val version = file.parent.fileName.toString()
         val expected = "kotlin-stdlib-${version}.jar"
@@ -127,7 +147,6 @@ private fun findArtifact(a: Artifact, source: Boolean): Path? {
         return result
     else {
         LOG.warning("Couldn't find $a in $result")
-
         return null
     }
 }
@@ -136,17 +155,19 @@ private fun mavenJarName(a: Artifact, source: Boolean) =
         if (source) "${a.artifact}-${a.version}-sources.jar"
         else "${a.artifact}-${a.version}.jar"
 
-private var cacheMvnCommand: Path? = null 
+private var cacheMvnCommand: Path? = null
 
 private fun mvnCommand(): Path {
-    if (cacheMvnCommand == null) 
+    if (cacheMvnCommand == null)
         cacheMvnCommand = doMvnCommand()
 
     return cacheMvnCommand!!
 }
 
+private fun isOSWindows() = (File.separatorChar == '\\')
+
 private fun doMvnCommand() =
-        if (File.separatorChar == '\\') windowsMvnCommand()
+        if (isOSWindows()) windowsMvnCommand()
         else unixMvnCommand()
 
 private fun windowsMvnCommand() =
